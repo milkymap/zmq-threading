@@ -23,5 +23,5 @@ class TaskStatus(str, Enum):
 class Task(BaseModel):
     task_id:str 
     topic:str 
-    content:str 
+    content:Any 
 

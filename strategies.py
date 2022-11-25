@@ -6,6 +6,9 @@ from glob import glob
 from time import time, sleep 
 from shutil import copyfile
 
+from typing import Any 
+from dataschema import Task
+
 from log import logger
 from worker import ZMQWorker
 from solver import ZMQSolver
@@ -14,8 +17,13 @@ class ZMQImageCopy(ZMQSolver):
     def __init__(self, path2target_dir:str) -> None:
         super(ZMQImageCopy, self).__init__()
         self.path2target_dir = path2target_dir 
+    
+    def initialize(self) -> None:
+        return super().initialize()
 
-    def process_message(self, path2source_image:str) -> int:
+    def process_message(self, task:Task, *args: Any, **kwds: Any) -> int:
+        
+        path2source_image:str = task.content
         if path.isfile(path2source_image):
             _, filename = path.split(path2source_image)
             path2target_image = path.join(self.path2target_dir, filename) 
@@ -37,17 +45,21 @@ def start_worker(path2source_dir:str, nb_solvers_per_switch:int):
         extensions.append([extension.upper()])
 
     start = time()
-    worker = ZMQWorker(
+    
+    workerpool = ZMQWorker(
         jobs=list(zip(priorities, extensions, image_paths)),
         swtich_config=[
             (['JPG', 'JPEG'], ZMQImageCopy('cache/jpg')), 
             (['PNG'], ZMQImageCopy('cache/png')), 
+            (['PDF', 'TXT'], ZMQImageCopy('cache/pdf')), 
         ], 
         nb_solvers_per_switch=nb_solvers_per_switch,  # this has to be an option for swtich 
         source2switch_address='inproc://source2switch', 
         switch_solver_address='inproc://switch_solver'
     )
-    worker.start_all_threads()
+    with workerpool as runner:
+        runner.running()
+
     end = time()
     duration = int((end - start) * 1000) 
     logger.debug(f'duration : {duration} ms')

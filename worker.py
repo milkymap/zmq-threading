@@ -5,6 +5,7 @@ import threading
 
 import uuid 
 import numpy as np 
+from time import sleep
 
 from log import logger 
 from typing import (
@@ -18,24 +19,27 @@ from solver import ZMQSolver
 class ZMQWorker:
 
     def __init__(self, 
-        jobs:List[Tuple[int, List[str], str]],  # list of (priority, [topics], message) 
-        swtich_config:List[Tuple[List[str], ZMQSolver]],
-        nb_solvers_per_switch:int,
-        source2switch_address:str, 
-        switch_solver_address:str, 
+            jobs:List[Tuple[int, List[str], Any]],  # list of (priority, [topics], message) 
+            swtich_config:List[Tuple[List[str], ZMQSolver]],   
+            nb_solvers_per_switch:int,
+            source2switch_address:str, 
+            switch_solver_address:str, 
         ):
 
         # add instance checking for switch_config 
 
         nb_switchs = len(swtich_config)
+        
         assert len(jobs) > 0
         assert nb_switchs > 0 
         assert nb_solvers_per_switch > 0 
 
         self.ctx = zmq.Context()
+        
         self.jobs = jobs 
         self.nb_switchs = nb_switchs
         self.swtich_config = swtich_config
+        
         self.nb_connected_swtichs = 0
         self.nb_solver_per_switchs = nb_solvers_per_switch
         self.source2switch_address = source2switch_address
@@ -46,18 +50,19 @@ class ZMQWorker:
         self.tasks_mutex = threading.Lock()
         self.tasks_states:Dict[str, Dict[str, TaskStatus]] = {}
         self.tasks_responses:Dict[str, Dict[str, Any]] = {}
-        
         self.nb_running_tasks = 0
 
         self.shutdown_signal = threading.Event()
-        
         self.source_quitloop = threading.Event()
         self.source_liveness = threading.Event()
+
         self.source_switch_condition = threading.Condition()
         
+        self.switchs_barrier = threading.Barrier(parties=self.nb_switchs) 
         self.switchs_liveness:List[threading.Event] = [] 
         self.switchs_quitloop:List[threading.Event] = []
         self.switchs_nb_connected_solvers:List[int] = []
+
         self.switch_solver_conditions:List[threading.Condition] = []
         
         for _ in range(self.nb_switchs):
@@ -81,13 +86,13 @@ class ZMQWorker:
         self.source_switch_condition.acquire()
         logger.success('source is waiting for switchs to connect')
         self.source_liveness.set()  # notify all switch that the source is up 
-        ret_val = self.source_switch_condition.wait_for(
+        returned_value = self.source_switch_condition.wait_for(
             predicate=lambda: self.nb_connected_swtichs == self.nb_switchs, 
             timeout=10
         )
 
-        if not ret_val:
-            logger.debug('source wait too long for switchs to connect')
+        if not returned_value:
+            logger.warning('source wait too long for switchs to connect')
             source2switch_socket.close()
             return -1 
         
@@ -104,6 +109,7 @@ class ZMQWorker:
                     if self.nb_running_tasks == 0:
                         keep_loop = False 
                         logger.debug('all tasks were done : system will shutdown')
+                        print(self.tasks_responses)
                     else:
                         logger.debug(f'nb running tasks(topic) : {self.nb_running_tasks}')
                 # end mutex context manager : free the lock 
@@ -126,6 +132,7 @@ class ZMQWorker:
                                         content=current_message
                                     )
                                     print(current_task)
+
                                     source2switch_socket.send_string(current_topic, flags=zmq.SNDMORE)
                                     source2switch_socket.send_pyobj(current_task)
                                     self.tasks_states[task_id][current_topic] = TaskStatus.PENDING
@@ -137,7 +144,7 @@ class ZMQWorker:
                             else:
                                 logger.debug(f'{current_topic} has no target subcribers | job {current_message} was not processed')
                                 self.tasks_states[task_id][current_topic] = TaskStatus.FAILED
-                        # end topic scaning 
+                        # end for loop over topics  
                         job_cursor = job_cursor + 1
                     # end mutext context manager : free the lock 
                 # end if available workers 
@@ -156,12 +163,15 @@ class ZMQWorker:
         logger.debug('all switch are disconnected from the source')
         source2switch_socket.close()
         logger.success('source has released its zeromq ressources')
+        self.threads_flag.set()  # notify main thread to end the zeromq context 
     # end function source 
         
     def switch(self, switch_id:int) -> None:
         liveness = self.source_liveness.wait(timeout=5)
         if not liveness:
+            logger.debug(f'switch {switch_id:03d} wait too long to get the signal from source')
             return -1 
+        
         logger.debug(f'switch {switch_id:03d} has received the signal from source')
         try:
             switch_solver_socket:zmq.Socket = self.ctx.socket(zmq.ROUTER)
@@ -177,16 +187,27 @@ class ZMQWorker:
         
         available_solvers = queue.SimpleQueue() 
         
+        try:
+            self.swtich_config[switch_id][1].initialize()  # 
+            self.switchs_barrier.wait(timeout=5)
+            logger.debug(f'switch {switch_id:03d} pass the barrier')
+            sleep(0.01)  # waiting 100ms => 
+        except threading.BrokenBarrierError:
+            logger.warning(f'switch {switch_id:03d} wait too long at the barrier')
+            switch_solver_socket.close()
+            source2switch_socket.close()
+            return -1 
+
         self.switch_solver_conditions[switch_id].acquire()
         logger.debug(f'switch {switch_id:03d} is waiting for solver to connect')
         self.switchs_liveness[switch_id].set()  # notify all solvers that belong to this group(switch_id) to start their loop 
-        ret_val = self.switch_solver_conditions[switch_id].wait_for(
+        returned_value = self.switch_solver_conditions[switch_id].wait_for(
             predicate=lambda: self.switchs_nb_connected_solvers[switch_id] == self.nb_solver_per_switchs, 
             timeout=10
         )
 
-        if not ret_val:
-            logger.debug(f'solver take too long time to connect to the switch {switch_id:03d}')
+        if not returned_value:
+            logger.warning(f'solvers take too long time to connect to the switch {switch_id:03d}')
             switch_solver_socket.close()
             source2switch_socket.close()
             return -1 
@@ -271,6 +292,7 @@ class ZMQWorker:
     def solver(self, switch_id:int, solver_id:int) -> None:
         liveness = self.switchs_liveness[switch_id].wait(timeout=5)
         if not liveness:
+            logger.warning(f'solver {solver_id:03d} wait too long to get the signal from {switch_id:03d}')
             return -1 
         
         logger.debug(f'solver {solver_id:03d} {switch_id:03d} has received the signal from the switch')
@@ -305,11 +327,9 @@ class ZMQWorker:
                     _, switch_encoded_message = message_from_switch  # ignore delimiter 
                     switch_plain_message:Task = pickle.loads(switch_encoded_message)
                     with self.tasks_mutex:
-                        print('blibli')
                         self.tasks_states[switch_plain_message.task_id][switch_plain_message.topic] = TaskStatus.RUNNING
-                        print('blbla')
                     try:
-                        response = self.swtich_config[switch_id][1](switch_plain_message.content)
+                        response = self.swtich_config[switch_id][1](task=switch_plain_message)
                         with self.tasks_mutex:
                             self.tasks_states[switch_plain_message.task_id][switch_plain_message.topic] = TaskStatus.DONE 
                             self.tasks_responses[switch_plain_message.task_id][switch_plain_message.topic] = response
@@ -336,38 +356,58 @@ class ZMQWorker:
             self.switchs_nb_connected_solvers[switch_id] -= 1 
             self.switch_solver_conditions[switch_id].notify()
             logger.debug(f'solver {solver_id:03d} {switch_id:03d} has released its zeromq ressource')
+        # free underlying lock  
     # end function solver 
     
-    def start_all_threads(self):
-        try:
-            # thread initialization 
-            source_thread = threading.Thread(target=self.source)
-            array_of_swtich_thread:List[threading.Thread] = []
-            array_of_solver_thread:List[threading.Thread] = []
-            for switch_id in range(self.nb_switchs):
-                switch_thread = threading.Thread(target=self.switch, args=[switch_id])
-                array_of_swtich_thread.append(switch_thread)
-                for solver_id in range(self.nb_solver_per_switchs):
-                    solver_thread = threading.Thread(target=self.solver, args=[switch_id, solver_id])
-                    array_of_solver_thread.append(solver_thread)
-            
-            # start all threads 
-            source_thread.start()
-            for switch_thread in array_of_swtich_thread:
+    def running(self):
+        # run all threads :  
+        try:    
+            self.source_thread.start()
+            for switch_thread in self.array_of_swtich_thread:
                 switch_thread.start()
-            for solver_thread in array_of_solver_thread:
+            for solver_thread in self.array_of_solver_thread:
                 solver_thread.start()
             
-            # wait for threads to terminate their loop 
+            # wait for threads to terminate their loops
             solver_thread.join()
-            for switch_thread in array_of_swtich_thread:
+            for switch_thread in self.array_of_swtich_thread:
                 switch_thread.join()
-            for solver_thread in array_of_solver_thread:
+            for solver_thread in self.array_of_solver_thread:
                 solver_thread.join()
+            
         except KeyboardInterrupt:
             logger.debug('ctl+c was catched => all threads will quit their loop')
             self.shutdown_signal.set()  # notify all thread to quit their loop 
         except Exception as e:
             logger.error(e)
-        finally:
-            self.ctx.term()
+    # end function running 
+
+    def __enter__(self):
+        try:
+            # thread initialization 
+            self.threads_flag = threading.Event()
+
+            self.source_thread = threading.Thread(target=self.source)
+            self.array_of_swtich_thread:List[threading.Thread] = []
+            self.array_of_solver_thread:List[threading.Thread] = []
+            
+            for switch_id in range(self.nb_switchs):
+                switch_thread = threading.Thread(target=self.switch, args=[switch_id])
+                self.array_of_swtich_thread.append(switch_thread)
+                for solver_id in range(self.nb_solver_per_switchs):
+                    solver_thread = threading.Thread(target=self.solver, args=[switch_id, solver_id])
+                    self.array_of_solver_thread.append(solver_thread)
+                # end for loop over solver_ids 
+            # end for loop over switch_ids 
+                    
+        except Exception as e:
+            logger.error(e)
+        return self 
+    # end special method 
+        
+    def __exit__(self, exc_type, exc_value, traceback):
+        logger.debug('main thread is waiting for all threads to quit their loop')
+        self.threads_flag.wait(timeout=10)  # wait 10s 
+        self.ctx.term()
+        logger.success('main thread has released all ressources')
+    # end special method 

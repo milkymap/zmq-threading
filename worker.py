@@ -3,23 +3,23 @@ import queue
 import pickle 
 import threading
 
+import uuid 
+import numpy as np 
+
 from log import logger 
 from typing import (
     List, Tuple, Dict, 
     Optional, Any, Callable
 )
 
-from solver import ZMQStrategy
+from dataschema import Priority, TaskStatus, SolverStatus, Task
+from solver import ZMQSolver 
 
 class ZMQWorker:
-    QUIT=b"QUIT"
-    JOIN=b'JOIN'
-    DONE=b"DONE"
-    RESP=b"RESP"
 
     def __init__(self, 
-        jobs:List[Tuple[List[str], str]],  # list of ([topics], message) 
-        swtich_config:List[Tuple[List[str], ZMQStrategy]],
+        jobs:List[Tuple[int, List[str], str]],  # list of (priority, [topics], message) 
+        swtich_config:List[Tuple[List[str], ZMQSolver]],
         nb_solvers_per_switch:int,
         source2switch_address:str, 
         switch_solver_address:str, 
@@ -43,6 +43,12 @@ class ZMQWorker:
 
         self.ctx.setsockopt(zmq.LINGER, 0)  # global option for all sockets 
 
+        self.tasks_mutex = threading.Lock()
+        self.tasks_states:Dict[str, Dict[str, TaskStatus]] = {}
+        self.tasks_responses:Dict[str, Dict[str, Any]] = {}
+        
+        self.nb_running_tasks = 0
+
         self.shutdown_signal = threading.Event()
         
         self.source_quitloop = threading.Event()
@@ -62,7 +68,6 @@ class ZMQWorker:
             )
             self.switchs_nb_connected_solvers.append(0)
         
-        self.switch2source_queue = queue.SimpleQueue()
         self.map_topic2nb_switchs = {}
 
     def source(self) -> None:
@@ -87,37 +92,54 @@ class ZMQWorker:
             return -1 
         
         logger.debug('all switchs are connected to the source')
-        responses = 0
         job_cursor = 0
         keep_loop = True 
         while keep_loop:
-            if responses >= len(self.jobs):
-                keep_loop = False 
-                logger.success('all jobs were processed | source will quit the loop')
-
             if self.shutdown_signal.is_set():
                 keep_loop = False 
-            try:
-                message_from_switch = self.switch2source_queue.get(block=True, timeout=0.01)
-                switch_message_type, switch_message_data = message_from_switch 
-                if switch_message_type == ZMQWorker.RESP:
-                    job_response = pickle.loads(switch_message_data)
-                    print(job_response)
-                    responses += 1        
-            except queue.Empty:
-                pass 
+            
+            if job_cursor >= len(self.jobs):
+                # all jobs were sent 
+                with self.tasks_mutex:
+                    if self.nb_running_tasks == 0:
+                        keep_loop = False 
+                        logger.debug('all tasks were done : system will shutdown')
+                    else:
+                        logger.debug(f'nb running tasks(topic) : {self.nb_running_tasks}')
+                # end mutex context manager : free the lock 
+                
             try:  # add a rate limiter based on the rate of response from switch thread 
                 if job_cursor < len(self.jobs) and len(self.map_topic2nb_switchs) > 0:
-                    current_job = self.jobs[job_cursor]
-                    topics, current_message = current_job
-                    for current_topic in topics:
-                        if current_topic in self.map_topic2nb_switchs:
-                            if self.map_topic2nb_switchs[current_topic] > 0:
-                                source2switch_socket.send_string(current_topic, flags=zmq.SNDMORE)
-                                source2switch_socket.send_pyobj((job_cursor, current_message))
-                        else:
-                            logger.debug(f'{current_topic} has no target subcribers | job {current_message} was not processed')
+                    with self.tasks_mutex:
+                        current_job:Tuple[int, List[str], str] = self.jobs[job_cursor]
+                        priority, topics, current_message = current_job  # ignore priority
+                        task_id = str(uuid.uuid4())  # unique task id 
+                        self.tasks_responses[task_id] = {} 
+                        self.tasks_states[task_id] = {}
+                            
+                        for current_topic in topics:        
+                            if current_topic in self.map_topic2nb_switchs:
+                                if self.map_topic2nb_switchs[current_topic] > 0:
+                                    current_task = Task(
+                                        task_id=task_id, 
+                                        topic=current_topic, 
+                                        content=current_message
+                                    )
+                                    print(current_task)
+                                    source2switch_socket.send_string(current_topic, flags=zmq.SNDMORE)
+                                    source2switch_socket.send_pyobj(current_task)
+                                    self.tasks_states[task_id][current_topic] = TaskStatus.PENDING
+                            
+                                    self.nb_running_tasks += 1
+
+                                else:
+                                    self.tasks_states[task_id][current_topic] = TaskStatus.FAILED
+                            else:
+                                logger.debug(f'{current_topic} has no target subcribers | job {current_message} was not processed')
+                                self.tasks_states[task_id][current_topic] = TaskStatus.FAILED
+                        # end topic scaning 
                         job_cursor = job_cursor + 1
+                    # end mutext context manager : free the lock 
                 # end if available workers 
             except Exception as e:
                 logger.error(e)
@@ -196,10 +218,12 @@ class ZMQWorker:
                 if polled_event == zmq.POLLIN:
                     message_from_source:Tuple[bytes, bytes]
                     message_from_source = source2switch_socket.recv_multipart()
-                    _, source_message_data = message_from_source
-                    switch_solver_socket.send_multipart([
-                        solver_address, b'', source_message_data 
-                    ])        
+                    _, source_encoded_message = message_from_source  # ignore the topic 
+                    source_plain_message:Task = pickle.loads(source_encoded_message)
+                    switch_solver_socket.send_multipart([solver_address, b''], flags=zmq.SNDMORE)
+                    switch_solver_socket.send(source_encoded_message)
+                    with self.tasks_mutex:
+                        self.tasks_states[source_plain_message.task_id][source_plain_message.topic] = TaskStatus.SCHEDULED        
                 else:
                     available_solvers.put(solver_address)
             except queue.Empty:
@@ -216,13 +240,9 @@ class ZMQWorker:
                 if polled_event == zmq.POLLIN:
                     message_from_solver:Tuple[bytes, bytes, bytes, bytes]
                     message_from_solver = switch_solver_socket.recv_multipart()
-                    solver_address, _, solver_message_type, solver_message_data = message_from_solver
-                    if solver_message_type == ZMQWorker.JOIN:
+                    solver_address, _, solver_encoded_message = message_from_solver
+                    if solver_encoded_message == SolverStatus.FREE:
                         available_solvers.put(solver_address)
-                    if solver_message_type == ZMQWorker.RESP:
-                        self.switch2source_queue.put(
-                            (ZMQWorker.RESP, solver_message_data)
-                        )
             except zmq.ZMQError:
                 pass 
             except Exception as e:
@@ -274,32 +294,33 @@ class ZMQWorker:
                 keep_loop = False 
             
             if not is_busy:
-                swtich_solver_socket.send_multipart([
-                    b'', ZMQWorker.JOIN, b''
-                ])
+                swtich_solver_socket.send_multipart([b'', SolverStatus.FREE])
                 is_busy = 1
                 
             try:
                 polled_event = swtich_solver_socket.poll(timeout=100)
                 if polled_event == zmq.POLLIN:
-                    _, swtich_encoded_message = swtich_solver_socket.recv_multipart()
-                    task_id, switch_plain_message = pickle.loads(swtich_encoded_message)
+                    message_from_switch:Tuple[bytes, bytes]
+                    message_from_switch = swtich_solver_socket.recv_multipart()
+                    _, switch_encoded_message = message_from_switch  # ignore delimiter 
+                    switch_plain_message:Task = pickle.loads(switch_encoded_message)
+                    with self.tasks_mutex:
+                        print('blibli')
+                        self.tasks_states[switch_plain_message.task_id][switch_plain_message.topic] = TaskStatus.RUNNING
+                        print('blbla')
                     try:
-                        job_response = self.swtich_config[switch_id][1](switch_plain_message)
+                        response = self.swtich_config[switch_id][1](switch_plain_message.content)
+                        with self.tasks_mutex:
+                            self.tasks_states[switch_plain_message.task_id][switch_plain_message.topic] = TaskStatus.DONE 
+                            self.tasks_responses[switch_plain_message.task_id][switch_plain_message.topic] = response
+                            self.nb_running_tasks -= 1 
                     except Exception as e:
                         logger.error(e)
-                        job_response = None 
-                    encoded_job_response = pickle.dumps({
-                        'task_id': f'{task_id:03d}',
-                        'switch_id': f'{switch_id:03d}', 
-                        'solver_id': f'{solver_id:03d}',
-                        'response': job_response
-                    })
-
-                    swtich_solver_socket.send_multipart([
-                        b'', ZMQWorker.RESP, encoded_job_response 
-                    ])
+                        with self.tasks_mutex:
+                            self.tasks_states[switch_plain_message.task_id][switch_plain_message.topic] = TaskStatus.FAILED
+                            self.nb_running_tasks -= 1
                     is_busy = 0  # the solver is free and can ask a new job  
+                # end event polling 
             except zmq.ZMQError:
                 pass 
             except Exception as e:

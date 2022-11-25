@@ -3,7 +3,7 @@ from typing import (
     List, Tuple, Dict, Any, Optional
 )
 
-class ZMQStrategy:
+class ZMQSolver:
     def __init__(self) -> None:
         pass
     

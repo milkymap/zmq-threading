@@ -8,11 +8,11 @@ from shutil import copyfile
 
 from log import logger
 from worker import ZMQWorker
-from solver import ZMQStrategy
+from solver import ZMQSolver
 
-class ZMQImageCopyStrategy(ZMQStrategy):
+class ZMQImageCopy(ZMQSolver):
     def __init__(self, path2target_dir:str) -> None:
-        super(ZMQImageCopyStrategy, self).__init__()
+        super(ZMQImageCopy, self).__init__()
         self.path2target_dir = path2target_dir 
 
     def process_message(self, path2source_image:str) -> int:
@@ -29,17 +29,19 @@ class ZMQImageCopyStrategy(ZMQStrategy):
 def start_worker(path2source_dir:str, nb_solvers_per_switch:int):
     image_paths = sorted(glob(path.join(path2source_dir, '*')))
     extensions = []
+    priorities = []
     for path2image in image_paths:
+        priorities.append(0)
         _, filename = path.split(path2image)
         extension:str = filename.split('.')[-1]
         extensions.append([extension.upper()])
 
     start = time()
     worker = ZMQWorker(
-        jobs=list(zip(extensions, image_paths)),
+        jobs=list(zip(priorities, extensions, image_paths)),
         swtich_config=[
-            (['JPG', 'JPEG'], ZMQImageCopyStrategy('cache/jpg')), 
-            (['PNG'], ZMQImageCopyStrategy('cache/png')), 
+            (['JPG', 'JPEG'], ZMQImageCopy('cache/jpg')), 
+            (['PNG'], ZMQImageCopy('cache/png')), 
         ], 
         nb_solvers_per_switch=nb_solvers_per_switch,  # this has to be an option for swtich 
         source2switch_address='inproc://source2switch', 

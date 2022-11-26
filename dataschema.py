@@ -4,9 +4,14 @@ from typing import (
 )
 from pydantic import BaseModel, Field
 
+class Priority(int, Enum):
+    LOW:int=2
+    MEDIUM:int=1 
+    HIGH:int=0 
+
 Topic = str
 Topics = List[Topic] 
-ListOfJobs = List[Tuple[int, Topics, Any]]  # list of (priority, [topics], message)
+ListOfJobs = List[Tuple[Priority, Topics, Any]]  # list of (priority, [topics], message)
 
 class SolverConfig(BaseModel):
     swtich_config:List[Tuple[Topics, Callable]]   
@@ -18,10 +23,11 @@ class WorkerConfig(BaseModel):
     jobs:ListOfJobs  
     solver_config:SolverConfig
 
-class Priority(int, Enum):
-    LOW:int=2
-    MEDIUM:int=1 
-    HIGH:int=0 
+class WorkerStatus(bytes, Enum):
+    BUSY:str=b'BUSY'
+    FREE:str=b'FREE'
+    QUIT:str=b'QUIT'
+    DONE:str=b'DONE'
 
 class SolverStatus(bytes, Enum):
     BUSY:str=b'BUSY'
@@ -33,7 +39,13 @@ class TaskStatus(str, Enum):
     RUNNING:str='RUNNING'
     PENDING:str='PENDING'
     SCHEDULED:str='SCHEDULED'
-    
+
+class Job(BaseModel):
+    task_id:str 
+    priority:Priority
+    topics:Topics
+    content:Any 
+
 class Task(BaseModel):
     task_id:str 
     topic:str 

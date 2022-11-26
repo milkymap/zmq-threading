@@ -13,37 +13,29 @@ from typing import (
     Optional, Any, Callable
 )
 
-from dataschema import Priority, TaskStatus, SolverStatus, Task
+from dataschema import Priority, TaskStatus, SolverStatus, Task, SolverConfig, WorkerConfig
 from solver import ZMQSolver 
 
 class ZMQWorker:
 
-    def __init__(self, 
-            jobs:List[Tuple[int, List[str], Any]],  # list of (priority, [topics], message) 
-            swtich_config:List[Tuple[List[str], ZMQSolver]],   
-            nb_solvers_per_switch:int,
-            source2switch_address:str, 
-            switch_solver_address:str, 
-        ):
+    def __init__(self, worker_config:WorkerConfig):
 
         # add instance checking for switch_config 
-
-        nb_switchs = len(swtich_config)
         
-        assert len(jobs) > 0
-        assert nb_switchs > 0 
-        assert nb_solvers_per_switch > 0 
+        assert len(worker_config.jobs) > 0
+        assert len(worker_config.solver_config.swtich_config) > 0 
+        assert worker_config.solver_config.nb_solvers_per_switch > 0 
 
         self.ctx = zmq.Context()
         
-        self.jobs = jobs 
-        self.nb_switchs = nb_switchs
-        self.swtich_config = swtich_config
+        self.jobs = worker_config.jobs 
+        self.nb_switchs = len(worker_config.solver_config.swtich_config)
+        self.swtich_config = worker_config.solver_config.swtich_config
         
         self.nb_connected_swtichs = 0
-        self.nb_solver_per_switchs = nb_solvers_per_switch
-        self.source2switch_address = source2switch_address
-        self.switch_solver_address = switch_solver_address
+        self.nb_solver_per_switchs = worker_config.solver_config.nb_solvers_per_switch
+        self.source2switch_address = worker_config.solver_config.source2switch_address
+        self.switch_solver_address = worker_config.solver_config.switch_solver_address
 
         self.ctx.setsockopt(zmq.LINGER, 0)  # global option for all sockets 
 
@@ -72,6 +64,7 @@ class ZMQWorker:
                 threading.Condition()
             )
             self.switchs_nb_connected_solvers.append(0)
+        # end loop over number of switchs 
         
         self.map_topic2nb_switchs = {}
 
@@ -131,7 +124,6 @@ class ZMQWorker:
                                         topic=current_topic, 
                                         content=current_message
                                     )
-                                    print(current_task)
 
                                     source2switch_socket.send_string(current_topic, flags=zmq.SNDMORE)
                                     source2switch_socket.send_pyobj(current_task)
@@ -191,7 +183,7 @@ class ZMQWorker:
             self.swtich_config[switch_id][1].initialize()  # 
             self.switchs_barrier.wait(timeout=5)
             logger.debug(f'switch {switch_id:03d} pass the barrier')
-            sleep(0.01)  # waiting 100ms => 
+            sleep(0.01)  # waiting 100ms 
         except threading.BrokenBarrierError:
             logger.warning(f'switch {switch_id:03d} wait too long at the barrier')
             switch_solver_socket.close()

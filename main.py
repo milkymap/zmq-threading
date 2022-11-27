@@ -1,7 +1,7 @@
 import click 
 
-from strategies import start_worker
 from log import logger 
+from commands import parallel_processing
 
 @click.group(chain=False, invoke_without_command=True)
 @click.pass_context
@@ -13,7 +13,7 @@ def command_line_interface(ctx:click.core.Context):
     
 
 command_line_interface.add_command(
-    cmd=start_worker, 
+    cmd=parallel_processing, 
     name='up'
 )
 if __name__ == '__main__':

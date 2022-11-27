@@ -3,53 +3,46 @@ import random
  
 from os import path
 from glob import glob 
-from time import time, sleep 
+
+from time import perf_counter
 
 
 from log import logger
-from worker import ZMQWorker
-from runner import ZMQRunner
-from dataschema import Task, SolverConfig
-
+from engine.runner import CCRRunner
+from dataschema.task_schema import SpecializedTask, GenericTask
+from dataschema.worker_schema import WorkerConfig, SwitchConfig
 from strategies import IMGSolver
 
 @click.command()
-@click.option('--path2source_dir', help='path to source files', type=click.Path(exists=True, dir_okay=True))
 @click.option('--nb_workers', help='number of workers', type=int, default=2)
-@click.option('--nb_solvers_per_switch', help='number of solvers per switch', type=int, default=4)
-def parallel_processing(path2source_dir:str, nb_workers:int, nb_solvers_per_switch:int):
-    image_paths = sorted(glob(path.join(path2source_dir, '*')))
-    extensions = []
-    priorities = []
-    for path2image in image_paths:
-        priorities.append(0)
-        _, filename = path.split(path2image)
-        extension:str = filename.split('.')[-1]
-        extensions.append([extension.upper()])
-
-    solver_config = SolverConfig(
-        swtich_config=[
-            (['JPG', 'JPEG'], IMGSolver('cache/jpg')), 
-            (['PNG'], IMGSolver('cache/png')), 
-            (['PDF', 'TXT'], IMGSolver('cache/pdf')), 
-        ], 
-        nb_solvers_per_switch=nb_solvers_per_switch,  # this has to be an option for swtich 
-        source2switch_address='inproc://source2switch', 
-        switch_solver_address='inproc://switch_solver'
+def parallel_processing(nb_workers:int):    
+    worker_config = WorkerConfig(
+        switch_config=[
+            SwitchConfig(
+                topics=['JPG', 'JPEG'],
+                nb_solvers=8, 
+                solver=IMGSolver(path2target_dir='cache/jpg')
+            ), 
+            SwitchConfig(
+                topics=['PNG'],
+                nb_solvers=8, 
+                solver=IMGSolver(path2target_dir='cache/png')
+            )
+        ],
+        max_nb_running_tasks=128
     )
         
-    start = time()
-    
-    runner = ZMQRunner(
-        list_of_jobs=list(zip(priorities, extensions, image_paths)),
-        nb_workers=nb_workers, 
-        solver_config=solver_config
+    start = perf_counter()
+    runner = CCRRunner(
+        nb_workers=nb_workers,
+        client_broker_address='ipc://client_broker.ipc',
+        broker_worker_address='ipc://broker_worker.ipc',
+        worker_config=worker_config
     )
-
     runner.running()
-
-    end = time()
-    duration = int((end - start) * 1000) 
-    logger.debug(f'duration : {duration} ms')
+    end = perf_counter()
+    
+    duration = end - start
+    logger.debug(f'duration : {duration} seconds')
 
     

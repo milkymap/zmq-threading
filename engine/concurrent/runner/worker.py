@@ -13,7 +13,7 @@ from time import sleep
 from log import logger 
 from typing import List, Tuple, Dict, Optional, Any, Sequence
 
-from dataschema.task_schema import Topic, TaskStatus, GenericTask, SpecializedTask, TaskResponse, TaskResponseData, ListOfTasks
+from dataschema.task_schema import Topic, TaskStatus, GenericTask, SpecializedTask
 from dataschema.worker_schema import WorkerConfig, WorkerResponse, WorkerStatus
 
 
@@ -125,13 +125,12 @@ class CCRRNRWorker:
                                 source2switch_socket.send_string(topic, flags=zmq.SNDMORE)
                                 source2switch_socket.send_pyobj(specialized_task)
                                 self.nb_running_tasks += 1 
-                                task_status = TaskStatus.PENDING              
                             else:
                                 logger.debug(f'{topic} has no target subcribers | job {generic_current_task.task_id} was not processed')
                                 task_status = TaskStatus.FAILED
                             
-                            self.tasks_states[generic_current_task.task_id][topic] = task_status
-                            self.tasks_responses[generic_current_task.task_id][topic] = None 
+                                self.tasks_states[generic_current_task.task_id][topic] = task_status
+                                self.tasks_responses[generic_current_task.task_id][topic] = None 
                         # end for loop over topics
                         task_cursor = task_cursor + 1 
                     # end mutex context manager : free the lock 
@@ -227,16 +226,11 @@ class CCRRNRWorker:
                 solver_address:bytes = available_solvers.get(block=True,  timeout=0.01)
                 polled_event = source2switch_socket.poll(timeout=100)
                 if polled_event == zmq.POLLIN:
-                    with self.tasks_mutex:
-                        message_from_source:List[bytes]
-                        message_from_source = source2switch_socket.recv_multipart()
-                        _, source_encoded_message = message_from_source  # ignore the topic 
-                        source_plain_message:SpecializedTask = pickle.loads(source_encoded_message)
-                        switch_solver_socket.send_multipart([solver_address, b''], flags=zmq.SNDMORE)
-                        switch_solver_socket.send(source_encoded_message)
-
-                        self.tasks_states[source_plain_message.task_id][source_plain_message.task_content] = TaskStatus.SCHEDULED
-                    # end mutex context manager : free the lock 
+                    message_from_source:List[bytes]
+                    message_from_source = source2switch_socket.recv_multipart()
+                    _, source_encoded_message = message_from_source  # ignore the topic 
+                    switch_solver_socket.send_multipart([solver_address, b''], flags=zmq.SNDMORE)
+                    switch_solver_socket.send(source_encoded_message)
                 else:
                     available_solvers.put(solver_address)
             except queue.Empty:

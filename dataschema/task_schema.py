@@ -17,9 +17,7 @@ class TaskStatus(str, Enum):
     DONE:str='DONE'
     FAILED:str='FAILED'
     RUNNING:str='RUNNING'
-    PENDING:str='PENDING'
-    SCHEDULED:str='SCHEDULED'
-
+    
 class GenericTask(BaseModel):
     task_id:str 
     priority:Priority

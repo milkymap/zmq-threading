@@ -113,8 +113,7 @@ class ZMQClient:
             self.shutdown_signal.set()
         except Exception as e:
             logger.error(e)
-        
-        sleep(3)  # wait 3s for thread to quit their context 
+        sleep(0.5)
         print(self.tasks_responses)
     
     def __enter__(self):

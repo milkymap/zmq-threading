@@ -21,8 +21,8 @@ def concurrent_server(nb_workers:int):
         switch_config=[
             SwitchConfig(
                 topics=['JPG', 'JPEG'],
-                nb_solvers=8, 
-                solver=IMGSolver(path2target_dir='cache/jpg')
+                nb_solvers=32, 
+                solver=SHASolver()
             ), 
             SwitchConfig(
                 topics=['PNG'],
@@ -30,7 +30,7 @@ def concurrent_server(nb_workers:int):
                 solver=IMGSolver(path2target_dir='cache/png')
             )
         ],
-        max_nb_running_tasks=512
+        max_nb_running_tasks=128
     )
         
     runner = CCRServer(

@@ -25,7 +25,8 @@ class CCRSRVWorker:
 
         self.nb_connected_switchs = 0
 
-        self.source2switch_address = f'inproc://source2switch_{worker_id:03d}'
+        # add srv:(server) as prefix to avoid collusion
+        self.source2switch_address = f'inproc://source2switch_{worker_id:03d}'   
         self.switch_solver_address = f'inproc://switch_solver_{worker_id:03d}'
         
         self.ctx.setsockopt(zmq.LINGER, 0)  # global option for all sockets 
@@ -96,8 +97,10 @@ class CCRSRVWorker:
                 assert response_from_switch.response_type == WorkerStatus.RESP
                 pusher_source_socket.send_string('', flags=zmq.SNDMORE)
                 pusher_source_socket.send_pyobj(response_from_switch)  # response_type can be either : FREE or RESP 
-                if response_from_switch.response_content.response_type in [TaskStatus.DONE, TaskStatus.FAILED]:
-                    self.nb_running_tasks -= 1   
+                
+                if response_from_switch.response_content is not None:
+                    if response_from_switch.response_content.response_type in [TaskStatus.DONE, TaskStatus.FAILED]:
+                        self.nb_running_tasks -= 1   
 
                 logger.debug(f'worker {self.worker_id:03d} ==> nb tasks : {self.nb_running_tasks:03d}')
             except queue.Empty:
@@ -132,7 +135,6 @@ class CCRSRVWorker:
                             source2switch_socket.send_string(topic, flags=zmq.SNDMORE)
                             source2switch_socket.send_pyobj(current_task)
                             self.nb_running_tasks += 1  # do not send PENDING STATUS
-                            task_status = TaskStatus.PENDING              
                         else:
                             logger.debug(f'{topic} has no target subcribers | job {task_id} was not processed')
                             task_status = TaskStatus.FAILED
@@ -252,25 +254,8 @@ class CCRSRVWorker:
                     message_from_source:List[bytes]
                     message_from_source = source2switch_socket.recv_multipart()
                     _, source_encoded_message = message_from_source  # ignore the topic 
-                    source_plain_message:SpecializedTask = pickle.loads(source_encoded_message)
                     switch_solver_socket.send_multipart([solver_address, b''], flags=zmq.SNDMORE)
                     switch_solver_socket.send(source_encoded_message)
-                    """
-                    self.source_switch_simple_queue.put(
-                        WorkerResponse(
-                            response_type=WorkerStatus.RESP,
-                            response_content=TaskResponse(
-                                response_type=TaskStatus.SCHEDULED, 
-                                response_content=TaskResponseData(
-                                    topic=source_plain_message.topic, 
-                                    task_id=source_plain_message.task_id, 
-                                    data=None
-                                )
-                            )
-                        )
-                    )
-                    """
-                    
                 else:
                     available_solvers.put(solver_address)
             except queue.Empty:
@@ -367,7 +352,6 @@ class CCRSRVWorker:
                     _, switch_encoded_message = message_from_switch  # ignore delimiter 
                     switch_plain_message:SpecializedTask = pickle.loads(switch_encoded_message)
                     
-                    """
                     switch_solver_socket.send_string('', flags=zmq.SNDMORE)
                     switch_solver_socket.send_pyobj(
                         WorkerResponse(
@@ -382,7 +366,6 @@ class CCRSRVWorker:
                             )
                         )
                     )
-                    """
                     
                     try:
                         solver_response = self.switch_config[switch_id].solver(task=switch_plain_message)

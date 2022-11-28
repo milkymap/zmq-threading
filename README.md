@@ -8,3 +8,8 @@ zmq-threading is a multithreading module that can solve any io-task(copy file, d
   </h3>  
 </p>
 
+# mypy validation 
+```bash
+mypy . --check-untyped-defs --explicit-package-bases
+```
+

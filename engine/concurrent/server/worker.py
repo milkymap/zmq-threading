@@ -11,12 +11,9 @@ from typing import List, Tuple, Dict, Optional, Any, Sequence
 from dataschema.task_schema import Topic, TaskStatus, GenericTask, SpecializedTask, TaskResponse, TaskResponseData
 from dataschema.worker_schema import WorkerConfig, WorkerResponse, WorkerStatus
 
-class ZMQWorker:
-
-    def __init__(self, worker_id:int, broker_worker_address:str, worker_config:WorkerConfig):
-
-        # add instance checking for switch_config 
-        
+class CCRSRVWorker:
+    "concurrent worker for server mode"
+    def __init__(self, worker_id:int, broker_worker_address:str, worker_config:WorkerConfig):        
         assert len(worker_config.switch_config) > 0  # use pydantic field
 
         self.ctx = zmq.Context()
@@ -31,9 +28,6 @@ class ZMQWorker:
         self.source2switch_address = f'inproc://source2switch_{worker_id:03d}'
         self.switch_solver_address = f'inproc://switch_solver_{worker_id:03d}'
         
-        self.broker_worker_address = None 
-        self.worker2collector_address = None 
-
         self.ctx.setsockopt(zmq.LINGER, 0)  # global option for all sockets 
 
         self.nb_running_tasks = 0
@@ -102,7 +96,10 @@ class ZMQWorker:
                 assert response_from_switch.response_type == WorkerStatus.RESP
                 pusher_source_socket.send_string('', flags=zmq.SNDMORE)
                 pusher_source_socket.send_pyobj(response_from_switch)  # response_type can be either : FREE or RESP 
-                self.nb_running_tasks -= 1     
+                if response_from_switch.response_content.response_type in [TaskStatus.DONE, TaskStatus.FAILED]:
+                    self.nb_running_tasks -= 1   
+
+                logger.debug(f'worker {self.worker_id:03d} ==> nb tasks : {self.nb_running_tasks:03d}')
             except queue.Empty:
                 pass 
                 
@@ -125,38 +122,35 @@ class ZMQWorker:
                     task_id=pusher_plain_message.task_id 
                     task_content=pusher_plain_message.task_content         
                     for topic in pusher_plain_message.topics:
-                        if topic in self.map_topic2nb_switchs:
-                            if self.map_topic2nb_switchs[topic] > 0:
-                                current_task = SpecializedTask(
-                                    topic=topic, 
-                                    task_id=task_id, 
-                                    task_content=task_content 
-                                )
+                        if topic in self.map_topic2nb_switchs and self.map_topic2nb_switchs[topic] > 0:
+                            current_task = SpecializedTask(
+                                topic=topic, 
+                                task_id=task_id, 
+                                task_content=task_content 
+                            )
 
-                                source2switch_socket.send_string(topic, flags=zmq.SNDMORE)
-                                source2switch_socket.send_pyobj(current_task)
-                                task_status = TaskStatus.PENDING
-                                self.nb_running_tasks += 1
-                                
-                            else:
-                                task_status = TaskStatus.FAILED
+                            source2switch_socket.send_string(topic, flags=zmq.SNDMORE)
+                            source2switch_socket.send_pyobj(current_task)
+                            self.nb_running_tasks += 1  # do not send PENDING STATUS
+                            task_status = TaskStatus.PENDING              
                         else:
                             logger.debug(f'{topic} has no target subcribers | job {task_id} was not processed')
                             task_status = TaskStatus.FAILED
-                        
-                        response2send_to_pusher = WorkerResponse(
-                            response_type=WorkerStatus.RESP,
-                            response_content=TaskResponse(
-                                response_type=task_status,
-                                response_content=TaskResponseData(
-                                    topic=topic,
-                                    task_id=task_id,
-                                    data=None  # no data 
+   
+                            response2send_to_pusher = WorkerResponse(
+                                response_type=WorkerStatus.RESP,
+                                response_content=TaskResponse(
+                                    response_type=task_status,
+                                    response_content=TaskResponseData(
+                                        topic=topic,
+                                        task_id=task_id,
+                                        data=None  # no data 
+                                    )
                                 )
                             )
-                        )
-                        pusher_source_socket.send_string('', flags=zmq.SNDMORE)
-                        pusher_source_socket.send_pyobj(response2send_to_pusher)
+                            pusher_source_socket.send_string('', flags=zmq.SNDMORE)
+                            pusher_source_socket.send_pyobj(response2send_to_pusher)
+
                     # end for loop over topics
                     has_asked_a_job = False  # can ask a new job to the pusher 
                 # end zeromq event polling form pusher socket 
@@ -261,7 +255,7 @@ class ZMQWorker:
                     source_plain_message:SpecializedTask = pickle.loads(source_encoded_message)
                     switch_solver_socket.send_multipart([solver_address, b''], flags=zmq.SNDMORE)
                     switch_solver_socket.send(source_encoded_message)
-                    
+                    """
                     self.source_switch_simple_queue.put(
                         WorkerResponse(
                             response_type=WorkerStatus.RESP,
@@ -275,6 +269,8 @@ class ZMQWorker:
                             )
                         )
                     )
+                    """
+                    
                 else:
                     available_solvers.put(solver_address)
             except queue.Empty:
@@ -371,6 +367,7 @@ class ZMQWorker:
                     _, switch_encoded_message = message_from_switch  # ignore delimiter 
                     switch_plain_message:SpecializedTask = pickle.loads(switch_encoded_message)
                     
+                    """
                     switch_solver_socket.send_string('', flags=zmq.SNDMORE)
                     switch_solver_socket.send_pyobj(
                         WorkerResponse(
@@ -385,13 +382,15 @@ class ZMQWorker:
                             )
                         )
                     )
-                           
+                    """
+                    
                     try:
                         solver_response = self.switch_config[switch_id].solver(task=switch_plain_message)
                         task_status = TaskStatus.DONE 
                     except Exception as e:
-                        logger.error(e)
-                        solver_response = None 
+                        error_message = f'{e}'
+                        logger.error(error_message)
+                        solver_response =error_message 
                         task_status = TaskStatus.FAILED
                     
                     switch_solver_socket.send_string('', flags=zmq.SNDMORE)

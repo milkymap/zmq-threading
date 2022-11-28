@@ -12,7 +12,7 @@ from dataschema.task_schema import GenericTask, TaskResponse, Priority
 from dataschema.worker_schema import WorkerResponse, WorkerStatus
 
 class ZMQBroker:
-
+    """broker base class"""
     def __init__(self, client_puller_address:str, pusher_worker_address:str):
         self.client_puller_address = client_puller_address
         self.pusher_worker_address = pusher_worker_address  # pusher_source_address 

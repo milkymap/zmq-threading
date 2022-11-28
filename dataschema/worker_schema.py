@@ -3,7 +3,7 @@ from typing import List, Tuple, Any, Optional
 from pydantic import BaseModel 
 from dataschema.task_schema import Topics, TaskResponse
 
-from engine.solver import ABCSolver
+from engine import ABCSolver
 
 class WorkerStatus(bytes, Enum):
     BUSY:bytes=b'BUSY'

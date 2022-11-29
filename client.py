@@ -14,13 +14,14 @@ from os import path
 from glob import glob 
 
 class ZMQClient:
-    def __init__(self, client_broker_address:str, nb_threads:int=16):
+    def __init__(self, client_broker_address:str, map_topic2nb_switchs:Dict[str, int], nb_threads:int=16):
         self.tasks_mutex = threading.Lock()
         self.tasks_states:Dict[str, Dict[str, TaskStatus]] = {}
-        self.tasks_responses:Dict[str, Dict[str, Any]] = {}        
+        self.tasks_responses:Dict[str, Dict[str, List[Dict[str, Any]] ]] = {}        
         self.client_broker_address = client_broker_address
         self.shutdown_signal = threading.Event()
         self.nb_threads = nb_threads
+        self.map_topic2nb_switchs = map_topic2nb_switchs
 
 
     def batch_submit_tasks(self, thread_id:int, tasks:ListOfTasks) -> int:
@@ -54,8 +55,10 @@ class ZMQClient:
                     task_content=task_content
                 ) 
 
-                nb_running_tasks += len(topics)
-
+                for topic in topics:
+                    nb_subscribers = self.map_topic2nb_switchs.get(topic, 0)
+                    nb_running_tasks += nb_subscribers
+                    
                 self.tasks_states[task_id] = {}
                 self.tasks_responses[task_id] = {}
 
@@ -74,10 +77,13 @@ class ZMQClient:
                 with self.tasks_mutex:
                     self.tasks_states[task_response_data.task_id][task_response_data.topic] = task_status
                     if task_status == TaskStatus.FAILED or task_status == TaskStatus.DONE:
-                        nb_running_tasks -= 1
-                        self.tasks_responses[task_response_data.task_id][task_response_data.topic] = task_response_data.data
+                        if task_response_data.topic not in self.tasks_responses[task_response_data.task_id]:
+                            self.tasks_responses[task_response_data.task_id][task_response_data.topic] = [] 
+                        self.tasks_responses[task_response_data.task_id][task_response_data.topic].append(task_response_data.data)
                         logger.debug(f'client {thread_id:03d} has got a response from broker: rmd:{nb_running_tasks:03d} | rep:{nb_reps} | tot:{len(tasks)}')
-                        nb_reps += 1
+                        if task_status == TaskStatus.DONE:
+                            nb_running_tasks -= 1
+                            nb_reps += 1
 
         # end while loop 
         logger.debug(f'client {thread_id:03d} has exited its loop')
@@ -140,8 +146,12 @@ if __name__ == '__main__':
         extensions.append([extension.upper()])
 
     list_of_tasks = list(zip(priorities, extensions, image_paths))
-    
+    map_topic2nb_switchs = {
+        'PNG': 2, 'JPG': 2, 'JPEG':2
+    }
+
     client = ZMQClient(
+        map_topic2nb_switchs=map_topic2nb_switchs,
         client_broker_address='ipc://client_broker.ipc', 
         nb_threads=32
     )
@@ -152,5 +162,5 @@ if __name__ == '__main__':
     end = perf_counter()
     
     duration = end - start
-    logger.debug(f'duration : {duration} seconds')
+    logger.debug(f'duration : {duration} seconds | nb tasks : {len(list_of_tasks)}')
 

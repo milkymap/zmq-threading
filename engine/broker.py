@@ -74,6 +74,7 @@ class ZMQBroker:
         
         self.client_puller_socket.close()
         self.pusher_worker_socket.close()
+        
     def __enter__(self):
         try:
             self.client_puller_socket:zmq.Socket = self.ctx.socket(zmq.ROUTER)

@@ -18,16 +18,24 @@ from strategies import IMGSolver, SHASolver
 @click.option('--nb_workers', help='number of workers', type=int, default=2)
 def concurrent_server(nb_workers:int):    
     worker_config = WorkerConfig(
-        switch_config=[
+        list_of_switch_configs=[
             SwitchConfig(
-                topics=['JPG', 'JPEG'],
+                topics=['JPG', 'JPEG', 'PNG'],
                 nb_solvers=32, 
-                solver=SHASolver()
+                solver=SHASolver(),
+                service_name='hash-service'
             ), 
             SwitchConfig(
                 topics=['PNG'],
-                nb_solvers=8, 
-                solver=IMGSolver(path2target_dir='cache/png')
+                nb_solvers=4, 
+                solver=IMGSolver(path2target_dir='cache/png'),
+                service_name='imagecopy-service'
+            ), 
+            SwitchConfig(
+                topics=['JPG', 'JPEG'],
+                nb_solvers=4, 
+                solver=IMGSolver(path2target_dir='cache/jpg'),
+                service_name='imagecopy-service'
             )
         ],
         max_nb_running_tasks=128
@@ -47,28 +55,28 @@ def concurrent_server(nb_workers:int):
 @click.option('--nb_workers', help='number of workers', type=int, default=2)
 def concurrent_runner(path2source_dir:str, nb_workers:int):    
     worker_config = WorkerConfig(
-        switch_config=[
+        list_of_switch_configs=[
             SwitchConfig(
                 topics=['HASH'],
-                nb_solvers=32, 
-                solver=SHASolver()
+                nb_solvers=16, 
+                solver=SHASolver(), 
+                service_name='hash-service'
             ), 
 
             SwitchConfig(
                 topics=['COPY'],
-                nb_solvers=4, 
-                solver=IMGSolver(path2target_dir='cache')
+                nb_solvers=16, 
+                solver=IMGSolver(path2target_dir='cache'), 
+                service_name='imagecopy'
             ),
         ],
-        max_nb_running_tasks=128
+        max_nb_running_tasks=512
     )
         
     filepaths = sorted(glob(path.join(path2source_dir, '*')))
     list_of_tasks:List[GenericTask] = []
    
     for path2image in filepaths:
-        _, filename = path.split(path2image)
-        extension:str = filename.split('.')[-1]
         topics = ['HASH', 'COPY']
         task = GenericTask(
             task_id=path2image, 

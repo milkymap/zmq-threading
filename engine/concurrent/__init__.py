@@ -1,7 +1,7 @@
 import multiprocessing as mp 
 
 
-from dataschema.task_schema import ListOfTasks, GenericTask, Topic 
+from dataschema.task_schema import GenericTask, Topic 
 from dataschema.worker_schema import WorkerConfig
 from engine.concurrent.server.worker import CCRSRVWorker
 from engine.concurrent.runner.worker import CCRRNRWorker

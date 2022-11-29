@@ -12,6 +12,7 @@ class WorkerStatus(bytes, Enum):
     RESP:bytes=b'RESP'
 
 class SwitchConfig(BaseModel):
+    service_name:str 
     topics:Topics
     solver:ABCSolver
     nb_solvers:int 
@@ -20,9 +21,9 @@ class SwitchConfig(BaseModel):
         arbitrary_types_allowed = True
     
 class WorkerConfig(BaseModel):
-    switch_config:List[SwitchConfig]  # nb_solvers_per_switch has to be in this option 
     max_nb_running_tasks:int 
-
+    list_of_switch_configs:List[SwitchConfig]  # nb_solvers_per_switch has to be in this option 
+    
     class Config:
         arbitrary_types_allowed = True
 

@@ -32,7 +32,7 @@ class SpecializedTask(BaseModel):
 class TaskResponseData(BaseModel):
     task_id:str
     topic:Topic 
-    data:Any=None  
+    data:Optional[Dict[str, Any]]=None   
 
 class TaskResponse(BaseModel):
     response_type:TaskStatus

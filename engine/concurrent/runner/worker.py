@@ -20,13 +20,13 @@ from dataschema.worker_schema import WorkerConfig, WorkerResponse, WorkerStatus
 class CCRRNRWorker:
     "concurrent worker for runner mode"
     def __init__(self, worker_id:int, list_of_tasks:List[GenericTask], worker_config:WorkerConfig, worker_barrier:Barrier, worker_responses_queue:mp.Queue):        
-        assert len(worker_config.switch_config) > 0  # use pydantic field
+        assert len(worker_config.list_of_switch_configs) > 0  # use pydantic field
 
         self.ctx = zmq.Context()
         
         self.worker_id = worker_id 
-        self.nb_switchs = len(worker_config.switch_config)
-        self.switch_config = worker_config.switch_config 
+        self.nb_switchs = len(worker_config.list_of_switch_configs)
+        self.list_of_switch_configs = worker_config.list_of_switch_configs 
         self.list_of_tasks = list_of_tasks
 
         self.nb_connected_switchs = 0
@@ -63,10 +63,10 @@ class CCRRNRWorker:
         
         self.tasks_mutex = threading.Lock()
         self.tasks_states:Dict[str, Dict[Topic, TaskStatus]] = {}
-        self.tasks_responses:Dict[str, Dict[Topic, Any]] = {}
-        self.worker_barrier:Barrier = worker_barrier
-        self.worker_responses_queue:mp.Queue[Dict[str, Dict[Topic, Any]]] = worker_responses_queue
+        self.tasks_responses:Dict[str, Dict[Topic, List[Dict[str, Any]]]] = {}
         
+        self.worker_barrier:Barrier = worker_barrier
+        self.worker_responses_queue:mp.Queue[Dict[str, Dict[Topic, List[Dict[str, Any]]]]] = worker_responses_queue
         
         self.map_topic2nb_switchs:Dict[Topic, int] = {}
 
@@ -74,7 +74,6 @@ class CCRRNRWorker:
         try:
             source2switch_socket:zmq.Socket = self.ctx.socket(zmq.PUB)
             source2switch_socket.bind(self.source2switch_address)
-
         except Exception as e:
             logger.error(e) 
             return -1
@@ -104,18 +103,22 @@ class CCRRNRWorker:
             if task_cursor >= len(self.list_of_tasks) and self.nb_running_tasks == 0:
                 keep_loop = False 
                 logger.debug(f'worker {self.worker_id} has finished to process its batch of tasks')
-                self.worker_responses_queue.put(self.tasks_responses)
+                self.worker_responses_queue.put(self.tasks_responses)  # replace it with a push socket to the main process 
                     
             try:
                 if task_cursor < len(self.list_of_tasks) and self.nb_running_tasks < self.max_nb_running_tasks:
                     with self.tasks_mutex:
+                        """
+                            this code can be speedup ...! 
+                            try to avoid the lock for sending message 
+                        """
                         generic_current_task = self.list_of_tasks[task_cursor]
-
                         self.tasks_states[generic_current_task.task_id] = {}
                         self.tasks_responses[generic_current_task.task_id] = {}
                         
                         for topic in generic_current_task.topics:
                             if topic in self.map_topic2nb_switchs and self.map_topic2nb_switchs[topic] > 0:
+                                nb_subscribers = self.map_topic2nb_switchs[topic]
                                 specialized_task = SpecializedTask(
                                     topic=topic, 
                                     task_id=generic_current_task.task_id, 
@@ -124,13 +127,14 @@ class CCRRNRWorker:
 
                                 source2switch_socket.send_string(topic, flags=zmq.SNDMORE)
                                 source2switch_socket.send_pyobj(specialized_task)
-                                self.nb_running_tasks += 1 
+                                self.nb_running_tasks += nb_subscribers 
+
+                                logger.debug(f'{topic} has {nb_subscribers} target switch_solvers')
                             else:
                                 logger.debug(f'{topic} has no target subcribers | job {generic_current_task.task_id} was not processed')
                                 task_status = TaskStatus.FAILED
-                            
                                 self.tasks_states[generic_current_task.task_id][topic] = task_status
-                                self.tasks_responses[generic_current_task.task_id][topic] = None 
+                            self.tasks_responses[generic_current_task.task_id][topic] = []
                         # end for loop over topics
                         task_cursor = task_cursor + 1 
                     # end mutex context manager : free the lock 
@@ -174,10 +178,10 @@ class CCRRNRWorker:
             logger.error(e)
             return -1 
         
-        available_solvers:queue.SimpleQueue[bytes] = queue.SimpleQueue() 
+        available_solvers:List[bytes] = [] 
         
         try:
-            self.switch_config[switch_id].solver.initialize() # add => catch the exception for this method 
+            self.list_of_switch_configs[switch_id].solver.initialize() # add => catch the exception for this method 
             self.switchs_barrier.wait(timeout=5)
             logger.debug(f'switch {switch_id:03d} pass the barrier')
             sleep(0.01)  # waiting 100ms 
@@ -191,7 +195,7 @@ class CCRRNRWorker:
         logger.debug(f'switch {switch_id:03d} is waiting for solver to connect')
         self.switchs_liveness[switch_id].set()  # notify all solvers that belong to this group(switch_id) to start their loop 
         returned_value = self.switch_solver_conditions[switch_id].wait_for(
-            predicate=lambda: self.switchs_nb_connected_solvers[switch_id] == self.switch_config[switch_id].nb_solvers, 
+            predicate=lambda: self.switchs_nb_connected_solvers[switch_id] == self.list_of_switch_configs[switch_id].nb_solvers, 
             timeout=10
         )
 
@@ -203,7 +207,7 @@ class CCRRNRWorker:
         
         logger.debug(f'all solvers are connected to the switch {switch_id:03d}')
         
-        list_of_topics:List[str] = self.switch_config[switch_id].topics
+        list_of_topics:List[str] = self.list_of_switch_configs[switch_id].topics
         with self.source_switch_condition:
             logger.debug(f'switch {switch_id:03d} got the lock and will register to : {list_of_topics}')
             for topic in list_of_topics:
@@ -215,50 +219,44 @@ class CCRRNRWorker:
             self.source_switch_condition.notify()  # wake up the source
             logger.debug(f'switch {switch_id:03d} is ready to process message')
         # free the unferlying lock so that, other switch can communicate with the source
-        
+        poller = zmq.Poller()
+        poller.register(source2switch_socket, zmq.POLLIN)
+        poller.register(switch_solver_socket, zmq.POLLIN)
+
         keep_loop = True 
         while keep_loop:
             if self.shutdown_signal.is_set():
                 keep_loop = False 
             try:
-                # check if there is an available solver 
-                # if yes then, pull data from source and send it to the solver 
-                solver_address:bytes = available_solvers.get(block=True,  timeout=0.01)
-                polled_event = source2switch_socket.poll(timeout=100)
-                if polled_event == zmq.POLLIN:
-                    message_from_source:List[bytes]
-                    message_from_source = source2switch_socket.recv_multipart()
-                    _, source_encoded_message = message_from_source  # ignore the topic 
-                    switch_solver_socket.send_multipart([solver_address, b''], flags=zmq.SNDMORE)
-                    switch_solver_socket.send(source_encoded_message)
-                else:
-                    available_solvers.put(solver_address)
-            except queue.Empty:
-                pass 
-            except zmq.ZMQError:
-                pass 
-            except Exception as e:
-                logger.error(e)
-                keep_loop = False 
+                map_socket2event = dict(poller.poll(timeout=100))
+                if len(available_solvers) > 0:
+                    # check if there is an available solver 
+                    # if yes then, pull data from source and send it to the solver 
+                    source2switch_event = map_socket2event.get(source2switch_socket, None)
+                    if source2switch_event is not None: 
+                        if source2switch_event == zmq.POLLIN: 
+                            message_from_source:List[bytes]
+                            message_from_source = source2switch_socket.recv_multipart()
+                            _, source_encoded_message = message_from_source  # ignore the topic 
+                            popped_solver_address = available_solvers.pop(0)  # fifo strategy 
+                            switch_solver_socket.send_multipart([popped_solver_address, b''], flags=zmq.SNDMORE)
+                            switch_solver_socket.send(source_encoded_message)
             
-            try:
-                # data from solver 
-                polled_event = switch_solver_socket.poll(timeout=100)
-                if polled_event == zmq.POLLIN:
-                    message_from_solver:List[bytes]
-                    message_from_solver = switch_solver_socket.recv_multipart()
-                    solver_address, _, solver_encoded_message = message_from_solver
-                    solver_plain_message:WorkerResponse = pickle.loads(solver_encoded_message)
-                    if solver_plain_message.response_type == WorkerStatus.FREE:
-                        available_solvers.put(solver_address)
-                    else:
-                        raise ValueError(f'{solver_plain_message.response_type} should always be FREE')
-                # end zeromq events polling  
-            except zmq.ZMQError:
-                pass 
+                switch_solver_event = map_socket2event.get(switch_solver_socket, None)
+                if switch_solver_event is not None: 
+                    if switch_solver_event == zmq.POLLIN: 
+                        message_from_solver:List[bytes]
+                        message_from_solver = switch_solver_socket.recv_multipart()
+                        solver_address, _, solver_encoded_message = message_from_solver
+                        solver_plain_message:WorkerResponse = pickle.loads(solver_encoded_message)
+                        if solver_plain_message.response_type == WorkerStatus.FREE:
+                            available_solvers.append(solver_address)
+                        else:
+                            raise ValueError(f'{solver_plain_message.response_type} should always be FREE')
+                # end zeromq events polling                
             except Exception as e:
                 logger.error(e)
-                keep_loop = False 
+                keep_loop = False  
         # end while loop  
         if not self.shutdown_signal.is_set():
             self.shutdown_signal.set()
@@ -319,16 +317,16 @@ class CCRRNRWorker:
             try:
                 polled_event = switch_solver_socket.poll(timeout=100)
                 if polled_event == zmq.POLLIN:
+                    message_from_switch:List[bytes]
+                    message_from_switch = switch_solver_socket.recv_multipart()
+                    _, switch_encoded_message = message_from_switch  # ignore delimiter 
+                    switch_plain_message:SpecializedTask = pickle.loads(switch_encoded_message)
+                        
                     with self.tasks_mutex:
-                        message_from_switch:List[bytes]
-                        message_from_switch = switch_solver_socket.recv_multipart()
-                        _, switch_encoded_message = message_from_switch  # ignore delimiter 
-                        switch_plain_message:SpecializedTask = pickle.loads(switch_encoded_message)
                         self.tasks_states[switch_plain_message.task_id][switch_plain_message.topic] = TaskStatus.RUNNING
                         
                     try:
-                        # this can take some time : so free the lock : task mutex
-                        solver_response = self.switch_config[switch_id].solver(task=switch_plain_message)  
+                        solver_response = self.list_of_switch_configs[switch_id].solver(task=switch_plain_message)  
                         task_status = TaskStatus.DONE 
                     except Exception as e:
                         error_message = f'{e}'
@@ -338,7 +336,9 @@ class CCRRNRWorker:
                     
                     with self.tasks_mutex:
                         self.tasks_states[switch_plain_message.task_id][switch_plain_message.topic] = task_status
-                        self.tasks_responses[switch_plain_message.task_id][switch_plain_message.topic] = solver_response
+                        self.tasks_responses[switch_plain_message.task_id][switch_plain_message.topic].append({
+                            self.list_of_switch_configs[switch_id].service_name: solver_response
+                        })
                         self.nb_running_tasks -= 1
                         logger.debug(f'worker [{self.worker_id:03d}/{switch_id:03d}/{solver_id:03d}] has consumed task : {switch_plain_message.task_id}')
 
@@ -400,7 +400,7 @@ class CCRRNRWorker:
             for switch_id in range(self.nb_switchs):
                 switch_thread = threading.Thread(target=self.switch, args=[switch_id])
                 self.array_of_switch_thread.append(switch_thread)
-                for solver_id in range(self.switch_config[switch_id].nb_solvers):
+                for solver_id in range(self.list_of_switch_configs[switch_id].nb_solvers):
                     solver_thread = threading.Thread(target=self.solver, args=[switch_id, solver_id])
                     self.array_of_solver_thread.append(solver_thread)
                 # end for loop over solver_ids 

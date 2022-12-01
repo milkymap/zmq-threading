@@ -10,9 +10,11 @@ from typing import List, Dict, Tuple
 
 from log import logger
 from engine.concurrent import CCRServer, CCRRunner
+from engine.parallel import PRLServer, PRLRunner
+
 from dataschema.task_schema import SpecializedTask, GenericTask, Priority
 from dataschema.worker_schema import WorkerConfig, SwitchConfig
-from strategies import IMGSolver, SHASolver
+from strategies import IMGSolver, SHASolver, MD5Solver, STFSolver
 
 @click.command()
 @click.option('--nb_workers', help='number of workers', type=int, default=2)
@@ -60,14 +62,14 @@ def concurrent_runner(path2source_dir:str, nb_workers:int):
                 topics=['HASH'],
                 nb_solvers=16, 
                 solver=SHASolver(), 
-                service_name='hash-service'
+                service_name='sha-hash'
             ), 
 
             SwitchConfig(
-                topics=['COPY'],
+                topics=['HASH'],
                 nb_solvers=16, 
-                solver=IMGSolver(path2target_dir='cache'), 
-                service_name='imagecopy'
+                solver=MD5Solver(), 
+                service_name='md5-hash'
             ),
         ],
         max_nb_running_tasks=512
@@ -93,6 +95,53 @@ def concurrent_runner(path2source_dir:str, nb_workers:int):
         worker_config=worker_config
     )
     runner.running()
+
+    
+@click.command()
+@click.option('--path2source_dir', help='path to source files', type=click.Path(exists=True, file_okay=False, dir_okay=True))
+@click.option('--nb_workers', help='number of workers', type=int, default=2)
+def parallel_runner(path2source_dir:str, nb_workers:int):    
+    worker_config = WorkerConfig(
+        list_of_switch_configs=[
+            SwitchConfig(
+                topics=['HASH'],
+                nb_solvers=4, 
+                solver=SHASolver(), 
+                service_name='sha-hash'
+            ), 
+            SwitchConfig(
+                topics=['Embedding'],
+                nb_solvers=2                ,
+                solver=STFSolver(transformer_name='clip-ViT-B-32', cache_dir='cache/transformers'),
+                service_name='embedding'
+            )
+        ],
+        max_nb_running_tasks=512
+    )
+        
+    filepaths = sorted(glob(path.join(path2source_dir, '*')))
+    list_of_tasks:List[GenericTask] = []
+      
+    for path2image in filepaths:
+        topics = ['HASH', 'Embedding']
+        task = GenericTask(
+            task_id=path2image, 
+            topics=topics,
+            task_content=path2image,
+            priority=Priority.MEDIUM
+        )
+
+        list_of_tasks.append(task)
+    
+    runner = PRLRunner(
+        list_of_tasks=list_of_tasks[:4096],
+        worker_config=worker_config,
+        switch2source_address='ipc://parallel_switch2source.ipc',
+        source2switch_address='ipc://parallel_source2switch.ipc',
+        switch_solver_address='ipc://parallel_switch_solver.ipc'
+    )
+    with runner as rnr:
+        rnr.running()
 
     
     

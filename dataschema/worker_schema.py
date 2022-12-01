@@ -10,6 +10,7 @@ class WorkerStatus(bytes, Enum):
     FREE:bytes=b'FREE'
     QUIT:bytes=b'QUIT'
     RESP:bytes=b'RESP'
+    JOIN:bytes=b'JOIN'
 
 class SwitchConfig(BaseModel):
     service_name:str 

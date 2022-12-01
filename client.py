@@ -78,8 +78,9 @@ class ZMQClient:
                     self.tasks_states[task_response_data.task_id][task_response_data.topic] = task_status
                     if task_status == TaskStatus.FAILED or task_status == TaskStatus.DONE:
                         if task_response_data.topic not in self.tasks_responses[task_response_data.task_id]:
-                            self.tasks_responses[task_response_data.task_id][task_response_data.topic] = [] 
-                        self.tasks_responses[task_response_data.task_id][task_response_data.topic].append(task_response_data.data)
+                            self.tasks_responses[task_response_data.task_id][task_response_data.topic] = []
+                        if task_response_data.data is not None: 
+                            self.tasks_responses[task_response_data.task_id][task_response_data.topic].append(task_response_data.data)
                         logger.debug(f'client {thread_id:03d} has got a response from broker: rmd:{nb_running_tasks:03d} | rep:{nb_reps} | tot:{len(tasks)}')
                         if task_status == TaskStatus.DONE:
                             nb_running_tasks -= 1

@@ -288,7 +288,7 @@ class CCRSRVWorker:
                         if solver_plain_message.response_type == WorkerStatus.FREE:
                             available_solvers.append(solver_address)  # add in fifo maner 
                         elif solver_plain_message.response_type == WorkerStatus.RESP:
-                            switch2source_socket.send_pyobj(solver_plain_message)
+                            switch2source_socket.send(solver_encoded_message)  # optimize this, do not decode for just accessing the response_type
                         else:
                             pass  # impossible due to pydantic schema valdiation   
             except Exception as e:

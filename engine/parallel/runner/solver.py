@@ -1,46 +1,66 @@
 import zmq 
-import queue 
 import pickle 
+
 import multiprocessing as mp 
-
-from multiprocessing.synchronize import Barrier
-
-import operator as op
-
-from time import sleep
+from multiprocessing.synchronize import Barrier, Event
 
 from log import logger 
-from typing import List, Tuple, Dict, Optional, Any, Sequence
 
 from engine import ABCSolver
-from dataschema.task_schema import Topic, TaskStatus, GenericTask, SpecializedTask
+from dataschema.task_schema import Topic, TaskStatus, GenericTask, SpecializedTask, TaskResponseData, TaskResponse
 from dataschema.worker_schema import WorkerConfig, WorkerResponse, WorkerStatus
 
 class PRLRNRSolver:
     "parallel worker for runner mode"
-    def __init__(self, switch_id:int, solver_id:int, solver_strategy:ABCSolver, worker_barrier:Barrier, worker_responses_queue:mp.Queue, swith_solver_address:str):        
+    def __init__(self, switch_liveness:Event, solver_start_loop:Event, shutdown_signal:Event, service_name:str, switch_id:int, solver_id:int, solver_strategy:ABCSolver, solver_barrier:Barrier, swith_solver_address:str):        
         self.solver_id = solver_id 
         self.switch_id = switch_id 
+        self.service_name = service_name
+
         self.solver_strategy = solver_strategy 
-        self.worker_barrier:Barrier = worker_barrier
-        self.worker_responses_queue:mp.Queue[Dict[str, Dict[Topic, Any]]] = worker_responses_queue
+        self.switch_solver_address = swith_solver_address.replace(
+            '.ipc', 
+            f'_{switch_id}.ipc'
+        )  # router server 
 
-        self.tasks_states:Dict[str, Dict[Topic, TaskStatus]] = {}
-        self.tasks_responses:Dict[str, Dict[Topic, Any]] = {}
+        self.solver_start_loop:Event = solver_start_loop
+        self.solver_barrier:Barrier = solver_barrier
+        self.switch_liveness:Event = switch_liveness
+        self.shutdown_signal:Event = shutdown_signal
 
-        self.switch_solver_address = swith_solver_address
+        self.ctx = zmq.Context()
+        self.ctx.setsockopt(zmq.LINGER, 0)
+
+        self.is_ready = 0
+        self.zmq_initialized = 0 
     
     def running(self) -> int:
-        try:
-            self.switch_solver_socket:zmq.Socket = self.ctx.socket(zmq.DEALER)
-            self.switch_solver_socket.connect(self.switch_solver_address)
-        except Exception as e:
-            logger.error(e)
-            return -1 
+        if not self.is_ready:
+            return 1 
+
+        self.switch_solver_socket.send_string('', flags=zmq.SNDMORE)
+        self.switch_solver_socket.send_pyobj(
+            WorkerResponse(
+                response_type=WorkerStatus.JOIN,
+                response_content=None 
+            )
+        )
         
+        logger.debug(f'solver {self.solver_id:03d} has connected to switch ({self.service_name})')
+        returned_value = self.solver_start_loop.wait(timeout=10)  # waiting signal from the switch process 
+        
+        if not returned_value:
+            logger.debug(f'solver {self.solver_id:03d} wait too long to get the signal {self.service_name}')
+            if not self.shutdown_signal.is_set():
+                self.shutdown_signal.set()
+            return 1 
+
         keep_loop = True 
         has_asked_a_task = False 
         while keep_loop:
+            if self.shutdown_signal.is_set():
+                keep_loop = False 
+           
             try:
                 if not has_asked_a_task:
                     self.switch_solver_socket.send_string('', flags=zmq.SNDMORE)
@@ -56,8 +76,21 @@ class PRLRNRSolver:
                 if polled_event == zmq.POLLIN: 
                     _, switch_encoded_message = self.switch_solver_socket.recv_multipart()
                     switch_plain_message:SpecializedTask = pickle.loads(switch_encoded_message)
-                    self.tasks_states[switch_plain_message.task_id][switch_plain_message.topic] = TaskStatus.RUNNING
-                    
+                    self.switch_solver_socket.send_string('', flags=zmq.SNDMORE)
+                    self.switch_solver_socket.send_pyobj(
+                        WorkerResponse(
+                            response_type=WorkerStatus.RESP,
+                            response_content=TaskResponse(
+                                response_type=TaskStatus.RUNNING,
+                                response_content=TaskResponseData(
+                                    topic=switch_plain_message.topic,
+                                    task_id=switch_plain_message.task_id, 
+                                    data=None 
+                                )
+                            )
+                        )
+                    )
+
                     try:
                         solver_response = self.solver_strategy(switch_plain_message)
                         task_status = TaskStatus.DONE 
@@ -66,10 +99,24 @@ class PRLRNRSolver:
                         error_message = f'{e}'
                         logger.error(error_message)
                         solver_response = error_message
+                    # send response 
                     
-                    self.tasks_states[switch_plain_message.task_id][switch_plain_message.topic] = task_status 
-                    self.tasks_responses[switch_plain_message.task_id][switch_plain_message.topic] = solver_response
-
+                    self.switch_solver_socket.send_string('', flags=zmq.SNDMORE)
+                    self.switch_solver_socket.send_pyobj(
+                        WorkerResponse(
+                            response_type=WorkerStatus.RESP,
+                            response_content=TaskResponse(
+                                response_type=task_status, 
+                                response_content=TaskResponseData(
+                                    task_id=switch_plain_message.task_id,
+                                    topic=switch_plain_message.topic, 
+                                    data={
+                                        self.service_name:solver_response
+                                    }
+                                )
+                            )
+                        )
+                    )
                     has_asked_a_task = False
             except KeyboardInterrupt:
                 keep_loop = False 
@@ -78,20 +125,44 @@ class PRLRNRSolver:
                 keep_loop = False  
         # end while loop 
         
+        if not self.shutdown_signal.is_set():
+            self.shutdown_signal.set()
+
+        return 0
         
     def __enter__(self):
-        self.ctx = zmq.Context()
-        self.ctx.setsockopt(zmq.LINGER, 0)
+        returned_value = self.switch_liveness.wait(timeout=5)
+        if not returned_value:
+            logger.debug(f'solver {self.solver_id:03d} wait too long to get the signal from switch {self.service_name}')
+            return self 
+        
         try:
-            self.solver_strategy.initialize()  # heavy intialization such as load a deep learning model 
-            self.worker_barrier.wait(timeout=30)
+            self.switch_solver_socket:zmq.Socket = self.ctx.socket(zmq.DEALER)
+            self.switch_solver_socket.connect(self.switch_solver_address)
+            logger.debug(f'solver {self.solver_id:03d} has initialized its zeromq socket {self.service_name}')
+            self.zmq_initialized = 1 
         except Exception as e:
             logger.error(e)
-            exit(1)  # end the code 
+            return self 
+         
+        try:
+            self.solver_strategy.initialize()  # heavy intialization such as load a deep learning model 
+            self.solver_barrier.wait(timeout=30)
+        except Exception as e:
+            logger.error(e)
+            return self 
+        
+        self.is_ready = 1
         return self 
     
     def __exit__(self, exc_type, exc_value, traceback):
-        pass 
-    
-        
+        logger.debug(f'solver {self.solver_id:03d} will quit the switch {self.service_name}')
+        if self.zmq_initialized:
+            self.switch_solver_socket.close()
+            logger.debug(f'solver {self.solver_id:03d} was disconnected {self.service_name}')
 
+        self.ctx.term()
+        logger.debug(f'solver {self.solver_id:03d} has disconnected from the switch {self.service_name}')
+        return True 
+        
+    

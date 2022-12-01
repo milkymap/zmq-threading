@@ -104,14 +104,8 @@ def parallel_runner(path2source_dir:str, nb_workers:int):
     worker_config = WorkerConfig(
         list_of_switch_configs=[
             SwitchConfig(
-                topics=['HASH'],
-                nb_solvers=4, 
-                solver=SHASolver(), 
-                service_name='sha-hash'
-            ), 
-            SwitchConfig(
                 topics=['Embedding'],
-                nb_solvers=2                ,
+                nb_solvers=2,               
                 solver=STFSolver(transformer_name='clip-ViT-B-32', cache_dir='cache/transformers'),
                 service_name='embedding'
             )
@@ -123,7 +117,7 @@ def parallel_runner(path2source_dir:str, nb_workers:int):
     list_of_tasks:List[GenericTask] = []
       
     for path2image in filepaths:
-        topics = ['HASH', 'Embedding']
+        topics = ['Embedding']
         task = GenericTask(
             task_id=path2image, 
             topics=topics,
@@ -134,7 +128,7 @@ def parallel_runner(path2source_dir:str, nb_workers:int):
         list_of_tasks.append(task)
     
     runner = PRLRunner(
-        list_of_tasks=list_of_tasks[:4096],
+        list_of_tasks=list_of_tasks[:128],
         worker_config=worker_config,
         switch2source_address='ipc://parallel_switch2source.ipc',
         source2switch_address='ipc://parallel_source2switch.ipc',

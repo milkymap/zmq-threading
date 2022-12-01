@@ -3,7 +3,10 @@ import pickle
 import threading
 import multiprocessing as mp 
 
+import queue 
 from time import sleep, time 
+
+
 
 from multiprocessing.synchronize import Event, Condition, Barrier
 
@@ -41,8 +44,9 @@ class PRLRNRSwitch:
         self.start_sync_solvers = threading.Event()
         self.synchronizer_condition = threading.Condition() 
         self.map_topic2nb_switchs:Dict[Topic, int] = {}
-    
-        self.list_of_solvers:List[List[bytes]] = []
+         
+        self.list_of_solvers:List[mp.Queue[bytes]] = []
+        self.list_of_switch_queues:List[List[bytes]] = []
         self.list_of_switch_liveness:List[Event] = []
         self.list_of_solver_barriers:List[Barrier] = []
 
@@ -65,7 +69,7 @@ class PRLRNRSwitch:
                 source2switch_socket:zmq.Socket = self.ctx.socket(zmq.SUB)
                 source2switch_socket.connect(self.source2switch_address)
                 self.list_of_source2switch_sockets.append(source2switch_socket)
-
+                
                 
                 self.list_of_switch_liveness.append(mp.Event())
                 self.list_of_solver_barriers.append(mp.Barrier(
@@ -87,7 +91,9 @@ class PRLRNRSwitch:
             
             # initialize all solvers list for each switch 
             for switch_id in range(self.nb_switchs):
-                self.list_of_solvers.append([])
+                self.list_of_solvers.append(mp.Queue())
+                self.list_of_switch_queues.append([]) 
+
 
             logger.success('all switch sockets were created')
             self.zmq_initialized = 1
@@ -116,7 +122,7 @@ class PRLRNRSwitch:
                 socket.close()  
             self.switch2source_socket.close()
 
-            logger.debug('switch sockets were disconnected')
+            logger.debug('all switch sockets were disconnected')
             return 0
         except Exception as e:
             logger.error(e)
@@ -158,7 +164,7 @@ class PRLRNRSwitch:
                 self.nb_ready_switchs += 1 # one switch is ready 
                 self.synchronizer_condition.notify()  # notify the main thread to check the condition 
         else:
-            logger.debug(f'switch {switch_id:03d} was not able to make syncrhonization with solvers')
+            logger.debug(f'switch {switch_id:03d} was not able to make syncrhonization with its solvers')
             
     def running(self) -> int:
         if not self.is_ready:
@@ -173,7 +179,8 @@ class PRLRNRSwitch:
                         kwargs={
                             'switch_id': switch_id, 
                             'solver_id': solver_id, 
-                            'solver_barrier': self.list_of_solver_barriers[switch_id] 
+                            'solver_barrier': self.list_of_solver_barriers[switch_id],
+                            'solver2switch_queue': self.list_of_solvers[switch_id]
                         }
                     ) 
                     solver_processes.append(process_)
@@ -213,6 +220,11 @@ class PRLRNRSwitch:
 
         if not returned_value:
             logger.debug('switchs were not able to make syncrhonization')
+            logger.debug(f'switchs are waiting for solvers to quit their loops')
+
+            for process_ in solver_processes:
+                process_.join()
+        
             return 1  
 
         self.switch2source_socket.send_pyobj(self.map_topic2nb_switchs)
@@ -222,6 +234,7 @@ class PRLRNRSwitch:
         if not returned_value:
             if not self.shutdown_signal.is_set():
                 self.shutdown_signal.set()
+            return 1 
 
         self.solver_start_loop.set()  # solver can start their loop 
 
@@ -232,31 +245,36 @@ class PRLRNRSwitch:
             try:
                 map_socket2event = dict(self.poller.poll(timeout=100))
                 for switch_id in range(self.nb_switchs):
-                    if len(self.list_of_solvers[switch_id]) > 0:
-                        source2switch_polled_event = map_socket2event.get(self.list_of_source2switch_sockets[switch_id], None)
-                        if source2switch_polled_event is not None:
-                            if source2switch_polled_event == zmq.POLLIN:
-                                popped_solver_address = self.list_of_solvers[switch_id].pop(0)
-                                message_from_source:List[bytes] = self.list_of_source2switch_sockets[switch_id].recv_multipart()
-                                _, source_encoded_message = message_from_source
-                                self.list_of_switch_solver_sockets[switch_id].send_multipart(
-                                    [popped_solver_address, b'', source_encoded_message]
-                                ) 
-                    
+                    source2switch_polled_event = map_socket2event.get(self.list_of_source2switch_sockets[switch_id], None)
+                    if source2switch_polled_event is not None:
+                        if source2switch_polled_event == zmq.POLLIN:
+                            message_from_source:List[bytes] = self.list_of_source2switch_sockets[switch_id].recv_multipart()
+                            _, source_encoded_message = message_from_source
+                            self.list_of_switch_queues[switch_id].append(source_encoded_message)
+                            
+                    while self.list_of_solvers[switch_id].qsize() > 0 and len(self.list_of_switch_queues[switch_id]) > 0:
+                        print('SEND', len(self.list_of_switch_queues[switch_id]), self.list_of_solvers[switch_id].qsize())
+                        try:
+                            popped_solver_address = self.list_of_solvers[switch_id].get(block=True, timeout=0.01)
+                            popped_source_encoded_message = self.list_of_switch_queues[switch_id].pop(0)
+                            self.list_of_switch_solver_sockets[switch_id].send_multipart(
+                                [popped_solver_address, b'', popped_source_encoded_message]
+                            )
+                        except queue.Empty:
+                            break  
+
                     switch_solver_polled_event = map_socket2event.get(self.list_of_switch_solver_sockets[switch_id], None)
                     if switch_solver_polled_event is not None: 
                         if switch_solver_polled_event == zmq.POLLIN: 
                             message_from_solver:List[bytes] = self.list_of_switch_solver_sockets[switch_id].recv_multipart()
                             solver_address, _, solver_encoded_message = message_from_solver
                             solver_plain_message:WorkerResponse = pickle.loads(solver_encoded_message)
-                            if solver_plain_message.response_type == WorkerStatus.FREE:
-                                self.list_of_solvers[switch_id].append(solver_address)
-                            elif solver_plain_message.response_type == WorkerStatus.RESP:
+                            if solver_plain_message.response_type == WorkerStatus.RESP:
                                 self.switch2source_socket.send_pyobj(solver_plain_message)
+                                print('RESP', len(self.list_of_switch_queues[switch_id]), self.list_of_solvers[switch_id].qsize())
                             else:  # impossible due to pydantic validation 
                                 pass 
                 # end for loop over switch_ids 
-
             except KeyboardInterrupt:
                 keep_loop = False 
 
@@ -268,14 +286,14 @@ class PRLRNRSwitch:
         if not self.shutdown_signal.is_set():
             self.shutdown_signal.set()
 
-        logger.debug(f'switchs are waiting for solvers to quit')
+        logger.debug(f'switchs are waiting for solvers to quit their loops')
         for process_ in solver_processes:
             process_.join()
         
         return 0 
         # end while loop 
         
-    def __start_solver(self, switch_id:int, solver_id:int, solver_barrier:Barrier):
+    def __start_solver(self, switch_id:int, solver_id:int, solver_barrier:Barrier, solver2switch_queue:mp.Queue):
         switch_liveness = self.list_of_switch_liveness[switch_id]
         solver_strategy = self.list_of_switch_configs[switch_id].solver
         service_name = self.list_of_switch_configs[switch_id].service_name
@@ -284,6 +302,7 @@ class PRLRNRSwitch:
             solver_id=solver_id,
             switch_id=switch_id,
             service_name=service_name,
+            solver2switch_queue=solver2switch_queue, 
             solver_start_loop=self.solver_start_loop,
             solver_barrier=solver_barrier,
             switch_liveness=switch_liveness,
@@ -298,7 +317,7 @@ class PRLRNRSwitch:
     def __enter__(self):
         liveness_returned_value = self.source_liveness.wait(timeout=5)
         if not liveness_returned_value:
-            logger.debug(f'switchs wait too long to get the signal from source')
+            logger.debug(f'switchs wait too long to get the signal from the source')
             return self 
 
         sockets_creation_returned_value:int = self.create_sockets()
@@ -312,6 +331,6 @@ class PRLRNRSwitch:
         if self.zmq_initialized:
             self.destroy_sockets()
 
-        logger.debug('all switchs were disconnected')
         self.ctx.term()
+        logger.debug('all switchs were disconnected and zmq context was released')
         

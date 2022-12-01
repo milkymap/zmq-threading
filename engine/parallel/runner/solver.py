@@ -5,6 +5,7 @@ import multiprocessing as mp
 from multiprocessing.synchronize import Barrier, Event
 
 from log import logger 
+from time import sleep 
 
 from engine import ABCSolver
 from dataschema.task_schema import Topic, TaskStatus, GenericTask, SpecializedTask, TaskResponseData, TaskResponse
@@ -12,7 +13,7 @@ from dataschema.worker_schema import WorkerConfig, WorkerResponse, WorkerStatus
 
 class PRLRNRSolver:
     "parallel worker for runner mode"
-    def __init__(self, switch_liveness:Event, solver_start_loop:Event, shutdown_signal:Event, service_name:str, switch_id:int, solver_id:int, solver_strategy:ABCSolver, solver_barrier:Barrier, swith_solver_address:str):        
+    def __init__(self, switch_liveness:Event, solver_start_loop:Event, shutdown_signal:Event, solver2switch_queue:mp.Queue, service_name:str, switch_id:int, solver_id:int, solver_strategy:ABCSolver, solver_barrier:Barrier, swith_solver_address:str):        
         self.solver_id = solver_id 
         self.switch_id = switch_id 
         self.service_name = service_name
@@ -27,6 +28,8 @@ class PRLRNRSolver:
         self.solver_barrier:Barrier = solver_barrier
         self.switch_liveness:Event = switch_liveness
         self.shutdown_signal:Event = shutdown_signal
+
+        self.solver2switch_queue:mp.Queue[bytes] = solver2switch_queue
 
         self.ctx = zmq.Context()
         self.ctx.setsockopt(zmq.LINGER, 0)
@@ -46,15 +49,16 @@ class PRLRNRSolver:
             )
         )
         
-        logger.debug(f'solver {self.solver_id:03d} has connected to switch ({self.service_name})')
+        logger.debug(f'solver {self.solver_id:03d} has connected to the switch ({self.service_name})')
         returned_value = self.solver_start_loop.wait(timeout=10)  # waiting signal from the switch process 
         
         if not returned_value:
-            logger.debug(f'solver {self.solver_id:03d} wait too long to get the signal {self.service_name}')
+            logger.debug(f'solver {self.solver_id:03d} wait too long to get the signal from the switch {self.service_name}')
             if not self.shutdown_signal.is_set():
                 self.shutdown_signal.set()
             return 1 
 
+        nb_hits = 0
         keep_loop = True 
         has_asked_a_task = False 
         while keep_loop:
@@ -63,13 +67,7 @@ class PRLRNRSolver:
            
             try:
                 if not has_asked_a_task:
-                    self.switch_solver_socket.send_string('', flags=zmq.SNDMORE)
-                    self.switch_solver_socket.send_pyobj(
-                        WorkerResponse(
-                            response_type=WorkerStatus.FREE,
-                            response_content=None
-                        )
-                    )
+                    self.solver2switch_queue.put(f'{self.solver_id:03d}'.encode())
                     has_asked_a_task = True  # do not ask a task twice 
                 
                 polled_event = self.switch_solver_socket.poll(timeout=100)
@@ -118,6 +116,7 @@ class PRLRNRSolver:
                         )
                     )
                     has_asked_a_task = False
+                    nb_hits += 1
             except KeyboardInterrupt:
                 keep_loop = False 
             except Exception as e:
@@ -125,6 +124,7 @@ class PRLRNRSolver:
                 keep_loop = False  
         # end while loop 
         
+        logger.debug(f'solver {self.solver_id:03d} got {nb_hits:05d} hits form the switch {self.service_name}')
         if not self.shutdown_signal.is_set():
             self.shutdown_signal.set()
 
@@ -133,13 +133,14 @@ class PRLRNRSolver:
     def __enter__(self):
         returned_value = self.switch_liveness.wait(timeout=5)
         if not returned_value:
-            logger.debug(f'solver {self.solver_id:03d} wait too long to get the signal from switch {self.service_name}')
+            logger.debug(f'solver {self.solver_id:03d} wait too long to get the signal from the switch {self.service_name}')
             return self 
         
         try:
             self.switch_solver_socket:zmq.Socket = self.ctx.socket(zmq.DEALER)
+            self.switch_solver_socket.setsockopt_string(zmq.IDENTITY, f'{self.solver_id:03d}')
             self.switch_solver_socket.connect(self.switch_solver_address)
-            logger.debug(f'solver {self.solver_id:03d} has initialized its zeromq socket {self.service_name}')
+            logger.debug(f'solver {self.solver_id:03d} has initialized its zeromq socket for the switch {self.service_name}')
             self.zmq_initialized = 1 
         except Exception as e:
             logger.error(e)
@@ -159,10 +160,10 @@ class PRLRNRSolver:
         logger.debug(f'solver {self.solver_id:03d} will quit the switch {self.service_name}')
         if self.zmq_initialized:
             self.switch_solver_socket.close()
-            logger.debug(f'solver {self.solver_id:03d} was disconnected {self.service_name}')
+            logger.debug(f'solver {self.solver_id:03d} was disconnected from the switch {self.service_name}')
 
         self.ctx.term()
-        logger.debug(f'solver {self.solver_id:03d} has disconnected from the switch {self.service_name}')
+        logger.debug(f'solver {self.solver_id:03d} has released its zmq context for the switch {self.service_name}')
         return True 
         
     

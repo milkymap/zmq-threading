@@ -69,6 +69,6 @@ class STFSolver(ABCSolver):
     
     def process_message(self, task: SpecializedTask, *args: Any, **kwds: Any) -> Any:
         pil_image = Image.open(task.task_content)
-        embedding = self.transformer.encode(pil_image)
+        embedding = self.transformer.encode(pil_image, device='cpu')
         return embedding
 

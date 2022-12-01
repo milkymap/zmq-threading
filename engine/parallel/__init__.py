@@ -67,6 +67,10 @@ class PRLRunner:
             logger.debug('no switch were available, source will quit the loop')
             if not self.shutdown_signal.is_set():
                 self.shutdown_signal.set()
+            
+            logger.debug('source waiting for switch to disconnect')
+            worker_process.join()
+
             return 1 
         
         self.switch_start_loop.set()  # notify switchs to start their loops 
@@ -82,6 +86,7 @@ class PRLRunner:
             try:
                 if self.shutdown_signal.is_set():
                     keep_loop = False 
+
                 if cursor >= len(self.list_of_tasks) and nb_running_tasks == 0:
                     keep_loop = False 
                 
@@ -103,7 +108,8 @@ class PRLRunner:
                                 nb_running_tasks -= 1
                                 nb_responses += 1
                                 logger.debug(f'source has got a response from broker: rmd:{nb_running_tasks:05d} | rep:{nb_responses:05d} | tot:{len(self.list_of_tasks):05d}')
-                
+                # end if zeromq event polling 
+
                 if cursor < len(self.list_of_tasks) and nb_running_tasks < max_nb_running_tasks:
                     generic_current_task = self.list_of_tasks[cursor]
                     self.tasks_states[generic_current_task.task_id] = {}
@@ -140,13 +146,13 @@ class PRLRunner:
         end = perf_counter()
         duration = end - start 
 
-        print(self.tasks_responses)
+        #print(self.tasks_responses)
         
         logger.debug(f'all workers have finished their jobs | duration : {duration}')
         if not self.shutdown_signal.is_set():
             self.shutdown_signal.set()
 
-        logger.debug('waiting for switch to disconnect')
+        logger.debug('source is waiting for switch to disconnect')
         worker_process.join()
 
         logger.debug(f'nb tasks : {len(self.tasks_responses)}')
